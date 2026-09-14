@@ -104,6 +104,7 @@ const PurePreviewMessage = ({
       createMessagePartSegments(
         message.parts.filter(
           (part) =>
+            part.type !== 'source-url' &&
             part.type !== 'data-error' || isCredentialErrorMessage(part.data),
         ),
       ),

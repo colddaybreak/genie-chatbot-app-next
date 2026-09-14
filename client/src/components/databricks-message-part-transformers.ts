@@ -1,5 +1,4 @@
 import type { ChatMessage } from '@chat-template/core';
-import { createDatabricksMessageCitationMarkdown } from './databricks-message-citation';
 import type { TextUIPart } from 'ai';
 
 /**
@@ -68,16 +67,7 @@ export const joinMessagePartSegments = (parts: ChatMessage['parts']) => {
       case 'text':
         return acc + part.text;
       case 'source-url':
-        console.log("acc.endsWith('|')", acc.endsWith('|'));
-        // Special case for markdown tables
-        if (acc.endsWith('|')) {
-          // 1. Remove the last pipe
-          // 2. Insert the citation markdown
-          // 3. Add the pipe back
-          return `${acc.slice(0, -1)} ${createDatabricksMessageCitationMarkdown(part)}|`;
-        }
-        return `${acc} ${createDatabricksMessageCitationMarkdown(part)}`;
-      default:
+        // Citations disabled — skip source-url parts
         return acc;
     }
   }, '');
