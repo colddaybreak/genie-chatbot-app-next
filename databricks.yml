@@ -1,0 +1,75 @@
+bundle:
+  name: databricks-chatbot
+
+variables:
+  genie_space_id:
+    description: "ID of the Genie space used by the app for natural language data queries"
+    # TODO: uncomment the line below and specify a default value to avoid needing to specify it on each deployment
+    # default: "your-genie-space-id-goes-here"
+  genie_space_name:
+    description: "Display name of the Genie space"
+    # TODO: uncomment the line below to provide a default display name
+    # default: "your-genie-space-name-goes-here"
+  database_instance_name:
+    description: "Base name of the Lakebase database instance"
+    default: "chatbot-lakebase"
+  resource_name_suffix:
+    description: "Suffix for resource names (app/lakebase instance names etc). Helpful for avoiding name collisions if multiple users deploy this app to the same workspace"
+
+resources:
+  database_instances:
+    # TODO (optional): Uncomment the database resource below to enable persistent chat history
+    # chatbot_lakebase:
+    #   name: ${var.database_instance_name}-${var.resource_name_suffix}
+    #   capacity: CU_1
+
+  apps:
+    databricks_chatbot:
+      # NOTE: customize the app name here, if desired
+      name: db-chatbot-${var.resource_name_suffix}
+      # NOTE: the app calls Genie on behalf of the user, so the user_api_scope
+      # below must be granted when the OAuth consent screen is shown.
+      description: "Chat application backed by Databricks AI/BI Genie for natural language data queries"
+      source_code_path: .
+      user_api_scopes:
+        - dashboards.genie
+      resources:
+        - name: genie-space
+          description: "Genie space for natural language data queries"
+          genie_space:
+            name: ${var.genie_space_name}
+            space_id: ${var.genie_space_id}
+            permission: CAN_RUN
+        # TODO (optional): Uncomment the database resource below to bind the app to the database instance above
+        # and enable persistent chat history
+        # - name: database
+        #   description: "Lakebase database instance for the chat app"
+        #   database:
+        #     database_name: databricks_postgres
+        #     instance_name: ${resources.database_instances.chatbot_lakebase.name}
+        #     permission: CAN_CONNECT_AND_CREATE
+        # TODO (optional): Uncomment the experiment resource below to enable the feedback widget.
+        # First run `npx tsx scripts/get-experiment-id.ts --endpoint <your-endpoint-name>` to find the experiment ID.
+        # Note: enabling feedback also requires a database (uncomment both TODO database blocks above).
+        # - name: experiment
+        #   description: "MLflow experiment for collecting user feedback"
+        #   experiment:
+        #     experiment_id: "your-experiment-id"
+        #     permission: CAN_EDIT
+
+targets:
+  dev:
+    mode: development
+    default: true
+    variables:
+      resource_name_suffix: dev-${workspace.current_user.domain_friendly_name}
+
+  staging:
+    mode: production
+    variables:
+      resource_name_suffix: "staging"
+
+  prod:
+    mode: production
+    variables:
+      resource_name_suffix: "prod"
