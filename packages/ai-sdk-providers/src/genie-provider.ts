@@ -17,8 +17,11 @@ import { getHostUrl } from '@chat-template/utils';
 // Header keys for passing context through streamText headers.
 // Kept in sync with providers-server.ts.
 const CONTEXT_HEADER_CONVERSATION_ID = 'x-databricks-conversation-id';
+// Forwarded by the server when the user has authorized the app (OBO).
+// Genie must be called as the user so their Unity Catalog grants apply.
+const CONTEXT_HEADER_ACCESS_TOKEN = 'x-forwarded-access-token';
 
-const GENIE_API_PREFIX = '/api/rest/2.0/genie/spaces';
+const GENIE_API_PREFIX = '/api/2.0/genie/spaces';
 
 const DEFAULT_POLL_INTERVAL_MS = 1500;
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -115,9 +118,16 @@ async function getWorkspaceHostname(): Promise<string> {
   return getHostUrl();
 }
 
-async function genieFetch(path: string, init?: RequestInit): Promise<Response> {
+async function genieFetch(
+  path: string,
+  init?: RequestInit,
+  authToken?: string,
+): Promise<Response> {
   const hostname = await getWorkspaceHostname();
-  const token = await getDatabricksToken();
+  // Prefer the user's on-behalf-of token so Genie enforces the signed-in
+  // user's Unity Catalog permissions; fall back to the app identity only
+  // when no user token was forwarded.
+  const token = authToken ?? (await getDatabricksToken());
   return fetch(`${hostname}${path}`, {
     ...init,
     headers: {
@@ -128,12 +138,16 @@ async function genieFetch(path: string, init?: RequestInit): Promise<Response> {
   });
 }
 
-async function genieFetchJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await genieFetch(path, init);
+async function genieFetchJson<T>(
+  path: string,
+  init?: RequestInit,
+  authToken?: string,
+): Promise<T> {
+  const response = await genieFetch(path, init, authToken);
   if (!response.ok) {
     const body = await response.text().catch(() => '');
     throw new Error(
-      `Genie API error (${response.status}) for ${path}: ${body.slice(0, 500)}`,
+      `Genie API error (${response.status}) for ${response.url || path}: ${body.slice(0, 500)}`,
     );
   }
   return (await response.json()) as T;
@@ -144,17 +158,20 @@ async function startGenieMessage(
   spaceId: string,
   content: string,
   conversationId: string | undefined,
+  authToken?: string,
 ): Promise<{ conversationId: string; messageId: string }> {
   if (conversationId) {
     const result = await genieFetchJson<GenieCreateMessageResponse>(
       `${GENIE_API_PREFIX}/${spaceId}/conversations/${conversationId}/messages`,
       { method: 'POST', body: JSON.stringify({ content }) },
+      authToken,
     );
     return { conversationId, messageId: result.message_id };
   }
   const result = await genieFetchJson<GenieStartConversationResponse>(
     `${GENIE_API_PREFIX}/${spaceId}/start-conversation`,
     { method: 'POST', body: JSON.stringify({ content }) },
+    authToken,
   );
   return {
     conversationId: result.conversation_id,
@@ -168,12 +185,15 @@ async function fetchQueryResult(
   conversationId: string,
   messageId: string,
   attachmentId: string,
+  authToken?: string,
 ): Promise<GenieStatementResponse | null> {
   try {
     const result = await genieFetchJson<{
       statement_response?: GenieStatementResponse;
     }>(
       `${GENIE_API_PREFIX}/${spaceId}/conversations/${conversationId}/messages/${messageId}/attachments/${attachmentId}/query-result`,
+      undefined,
+      authToken,
     );
     return result.statement_response ?? null;
   } catch (error) {
@@ -188,6 +208,7 @@ async function renderQueryAttachment(
   conversationId: string,
   messageId: string,
   attachment: GenieAttachment,
+  authToken?: string,
 ): Promise<string> {
   const query = attachment.query;
   if (!query) return '';
@@ -211,6 +232,7 @@ async function renderQueryAttachment(
       conversationId,
       messageId,
       attachment.attachment_id,
+      authToken,
     );
     const columns = statement?.manifest?.schema?.columns ?? [];
     const rows = statement?.result?.data_array ?? [];
@@ -237,6 +259,7 @@ async function renderMessageText(
   spaceId: string,
   conversationId: string,
   message: GenieMessage,
+  authToken?: string,
 ): Promise<string> {
   const parts: string[] = [];
 
@@ -249,6 +272,7 @@ async function renderMessageText(
       conversationId,
       message.message_id,
       attachment,
+      authToken,
     );
     if (sqlBlock) parts.push(sqlBlock);
 
@@ -374,6 +398,8 @@ export class GenieLanguageModel implements LanguageModelV3 {
             string | undefined
           >;
           const chatId = headers[CONTEXT_HEADER_CONVERSATION_ID];
+          // Call Genie as the signed-in user (OBO) so their UC grants apply.
+          const oboToken = headers[CONTEXT_HEADER_ACCESS_TOKEN];
           const existingConversationId = chatId
             ? chatToGenieConversation.get(chatId)
             : undefined;
@@ -382,6 +408,7 @@ export class GenieLanguageModel implements LanguageModelV3 {
             spaceId,
             content,
             existingConversationId,
+            oboToken,
           );
           if (chatId) {
             chatToGenieConversation.set(chatId, conversationId);
@@ -408,6 +435,7 @@ export class GenieLanguageModel implements LanguageModelV3 {
             messageId,
             options.abortSignal,
             emitStatus,
+            oboToken,
           );
 
           if (reasoningStarted) {
@@ -431,6 +459,7 @@ export class GenieLanguageModel implements LanguageModelV3 {
             spaceId,
             conversationId,
             message,
+            oboToken,
           );
           if (text) {
             controller.enqueue({ type: 'text-start', id: textId });
@@ -471,6 +500,7 @@ export class GenieLanguageModel implements LanguageModelV3 {
     messageId: string,
     signal: AbortSignal | undefined,
     onStatus: (status: string) => void,
+    authToken?: string,
   ): Promise<GenieMessage> {
     const pollIntervalMs = DEFAULT_POLL_INTERVAL_MS;
     const deadline = Date.now() + DEFAULT_TIMEOUT_MS;
@@ -486,6 +516,8 @@ export class GenieLanguageModel implements LanguageModelV3 {
 
       const message = await genieFetchJson<GenieMessage>(
         `${GENIE_API_PREFIX}/${spaceId}/conversations/${conversationId}/messages/${messageId}`,
+        undefined,
+        authToken,
       );
 
       if (message.status !== lastStatus) {
