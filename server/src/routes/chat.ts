@@ -12,7 +12,10 @@ import {
   type LanguageModelUsage,
   pipeUIMessageStreamToResponse,
 } from 'ai';
-import type { LanguageModelV3Usage } from '@ai-sdk/provider';
+import type {
+  LanguageModelV3,
+  LanguageModelV3Usage,
+} from '@ai-sdk/provider';
 
 // Convert ai's LanguageModelUsage to @ai-sdk/provider's LanguageModelV3Usage
 function toV3Usage(usage: LanguageModelUsage): LanguageModelV3Usage {
@@ -51,23 +54,52 @@ import {
   checkChatAccess,
   convertToUIMessages,
   generateUUID,
+  isGenieConfigured,
   myProvider,
   postRequestBodySchema,
   type PostRequestBody,
   StreamCache,
+  SYNTHESIS_MODEL_ID,
   type VisibilityType,
   CONTEXT_HEADER_CONVERSATION_ID,
   CONTEXT_HEADER_USER_ID,
 } from '@chat-template/core';
 import { ChatSDKError } from '@chat-template/core/errors';
 import { storeMessageMeta } from '../lib/message-meta-store';
-import { drainStreamToWriter, fallbackToGenerateText } from '../lib/stream-fallback';
+import {
+  drainStreamCapturingText,
+  drainStreamToWriter,
+  fallbackToGenerateText,
+} from '../lib/stream-fallback';
+import {
+  buildSynthesisPrompt,
+  getSynthesisSystemPrompt,
+} from '../lib/synthesis-prompt';
 
 export const chatRouter: RouterType = Router();
 
 const streamCache = new StreamCache();
 // Apply auth middleware to all chat routes
 chatRouter.use(authMiddleware);
+
+/**
+ * Resolves the stage-2 synthesis model. Returns null when Genie mode is off or
+ * the model cannot be created, in which case the request uses the single-stage
+ * streaming path.
+ */
+async function resolveSynthesisModel(
+  isGenieMode: boolean,
+): Promise<LanguageModelV3 | null> {
+  if (!isGenieMode) {
+    return null;
+  }
+  try {
+    return await myProvider.languageModel(SYNTHESIS_MODEL_ID);
+  } catch (err) {
+    console.error('[Chat] Failed to create synthesis model:', err);
+    return null;
+  }
+}
 
 /**
  * POST /api/chat - Send a message and get streaming response
@@ -258,6 +290,21 @@ chatRouter.post('/', requireAuth, async (req: Request, res: Response) => {
         : {}),
     };
 
+    // Two-stage mode: when the chat is backed by a Genie space, `model` above
+    // is Genie (stage 1) and the synthesis model (stage 2) rewrites its raw
+    // output into the final answer. Null disables the second stage.
+    const synthesisModel = await resolveSynthesisModel(isGenieConfigured());
+
+    // Original user question, used to ground the synthesis stage.
+    const lastUserMessage = [...uiMessages]
+      .reverse()
+      .find((m) => m.role === 'user');
+    const userQuestion = (lastUserMessage?.parts ?? [])
+      .map((part) => (part.type === 'text' ? part.text : ''))
+      .filter((text) => text.length > 0)
+      .join('\n')
+      .trim();
+
     const result = streamText({
       model,
       messages: modelMessages,
@@ -322,17 +369,106 @@ chatRouter.post('/', requireAuth, async (req: Request, res: Response) => {
           },
         });
 
-        const { failed } = await drainStreamToWriter(aiStream, writer);
-
-        if (failed) {
-          console.log('Streaming failed, falling back to generateText...');
-          const fallbackResult = await fallbackToGenerateText(
-            { model, messages: modelMessages, headers: requestHeaders },
+        if (synthesisModel) {
+          // Stage 1 (Genie): keep streaming its progress (reasoning/status) to
+          // the client, but hold back the raw text. That text is the evidence
+          // handed to stage 2 rather than the final answer.
+          const { failed, text: evidence } = await drainStreamCapturingText(
+            aiStream,
             writer,
           );
 
-          finalUsage = fallbackResult?.usage;
-          traceId = fallbackResult?.traceId ?? null;
+          if (failed) {
+            // The error chunk was already forwarded; don't synthesize on top of
+            // a failed Genie run.
+            console.log('[Chat] Genie stage failed, skipping synthesis');
+          } else if (evidence.trim().length === 0) {
+            console.log('[Chat] Genie returned no evidence, skipping synthesis');
+          } else {
+            // Hand Genie's raw output to the client as its own part so it can
+            // be rendered separately from the synthesized answer.
+            writer.write({
+              type: 'data-genieEvidence',
+              data: { markdown: evidence },
+            });
+
+            // Stage 2 (synthesis LLM): real token streaming for the answer.
+            try {
+              const synthResult = streamText({
+                model: synthesisModel,
+                system: getSynthesisSystemPrompt(),
+                prompt: buildSynthesisPrompt({
+                  question: userQuestion,
+                  evidence,
+                }),
+                headers: requestHeaders,
+                onFinish: ({ usage }) => {
+                  finalUsage = usage;
+                },
+              });
+
+              const synthStream = synthResult.toUIMessageStream<ChatMessage>({
+                sendReasoning: false,
+                sendSources: false,
+                sendFinish: false,
+                onError: (error) => {
+                  const msg =
+                    error instanceof Error ? error.message : String(error);
+                  writer.onError?.(error);
+                  return msg;
+                },
+              });
+
+              const { failed: synthFailed } = await drainStreamToWriter(
+                synthStream,
+                writer,
+                // The UI stream already started during stage 1 - drop the synth
+                // stream's `start` chunk so the message id is preserved.
+                { skipStart: true },
+              );
+
+              if (synthFailed) {
+                console.log(
+                  'Synthesis streaming failed, falling back to generateText...',
+                );
+                const fallbackResult = await fallbackToGenerateText(
+                  {
+                    model: synthesisModel,
+                    system: getSynthesisSystemPrompt(),
+                    prompt: buildSynthesisPrompt({
+                      question: userQuestion,
+                      evidence,
+                    }),
+                    headers: requestHeaders,
+                  },
+                  writer,
+                );
+                finalUsage = fallbackResult?.usage ?? finalUsage;
+              }
+            } catch (err) {
+              // Last resort: surface the raw Genie evidence so the user still
+              // gets an answer instead of an empty message.
+              console.error('[Chat] Synthesis stage failed:', err);
+              const textId = generateUUID();
+              writer.write({ type: 'text-start', id: textId });
+              writer.write({ type: 'text-delta', id: textId, delta: evidence });
+              writer.write({ type: 'text-end', id: textId });
+            }
+          }
+        } else {
+          // Single-stage mode (non-Genie): unchanged streaming path.
+          const { failed } = await drainStreamToWriter(aiStream, writer);
+
+          if (failed) {
+            console.log('Streaming failed, falling back to generateText...');
+            const fallbackResult = await fallbackToGenerateText(
+              { model, messages: modelMessages, headers: requestHeaders },
+              writer,
+            );
+
+            finalUsage = fallbackResult?.usage;
+            traceId = fallbackResult?.traceId ?? null;
+          }
         }
         if (titlePromise) {
           const generatedTitle = await titlePromise;

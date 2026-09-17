@@ -12,6 +12,11 @@ export type CustomUIDataTypes = {
   usage: LanguageModelUsage;
   traceId: string | null;
   title: string;
+  // Raw output of the Genie stage, streamed as `data-genieEvidence` so the
+  // client can render it separately from the synthesized answer.
+  genieEvidence: {
+    markdown: string;
+  };
 };
 
 export type ChatMessage = UIMessage<MessageMetadata, CustomUIDataTypes>;

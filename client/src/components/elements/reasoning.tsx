@@ -15,6 +15,7 @@ type ReasoningContextValue = {
   isOpen: boolean;
   setIsOpen: (open: boolean) => void;
   duration: number;
+  elapsedSeconds: number;
 };
 
 const ReasoningContext = createContext<ReasoningContextValue | null>(null);
@@ -61,6 +62,24 @@ export const Reasoning = memo(
 
     const [hasAutoClosedRef, setHasAutoClosedRef] = useState(false);
     const [startTime, setStartTime] = useState<number | null>(null);
+    const [elapsedSeconds, setElapsedSeconds] = useState(0);
+
+    // Tick a live counter while streaming so the user sees continuous progress
+    // during long backend waits (e.g. Genie's submit-and-poll latency).
+    useEffect(() => {
+      if (!isStreaming) {
+        setElapsedSeconds(0);
+        return;
+      }
+
+      const startedAt = Date.now();
+      setElapsedSeconds(0);
+      const timer = setInterval(() => {
+        setElapsedSeconds(Math.floor((Date.now() - startedAt) / MS_IN_S));
+      }, 250);
+
+      return () => clearInterval(timer);
+    }, [isStreaming]);
 
     // Track duration when streaming starts and ends
     useEffect(() => {
@@ -93,7 +112,7 @@ export const Reasoning = memo(
 
     return (
       <ReasoningContext.Provider
-        value={{ isStreaming, isOpen, setIsOpen, duration }}
+        value={{ isStreaming, isOpen, setIsOpen, duration, elapsedSeconds }}
       >
         <Collapsible
           className={cn('not-prose', className)}
@@ -112,7 +131,7 @@ type ReasoningTriggerProps = ComponentProps<typeof CollapsibleTrigger>;
 
 export const ReasoningTrigger = memo(
   ({ className, children, ...props }: ReasoningTriggerProps) => {
-    const { isStreaming, isOpen, duration } = useReasoning();
+    const { isStreaming, isOpen, duration, elapsedSeconds } = useReasoning();
 
     return (
       <CollapsibleTrigger
@@ -130,7 +149,13 @@ export const ReasoningTrigger = memo(
                 isOpen ? 'rotate-180' : 'rotate-0',
               )}
             />
-            {isStreaming && <p>Thinking...</p>}
+            {isStreaming && (
+              <p>
+                {elapsedSeconds > 0
+                  ? `Thinking... ${elapsedSeconds}s`
+                  : 'Thinking...'}
+              </p>
+            )}
             {duration > 0 && <p>Thought for {duration}s</p>}
             {!isStreaming && duration === 0 && <p>Thoughts</p>}
 
