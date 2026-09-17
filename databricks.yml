@@ -29,10 +29,14 @@ resources:
       name: c-mold-chatbot
       # NOTE: the app calls Genie on behalf of the user, so the user_api_scope
       # below must be granted when the OAuth consent screen is shown.
+      # model-serving is also required: the second stage of the two-stage
+      # orchestration calls a plain serving endpoint (the synthesis model) with
+      # the forwarded user token, so the user must authorize that scope too.
       description: "Chat application backed by Databricks AI/BI Genie for natural language data queries"
       source_code_path: .
       user_api_scopes:
         - dashboards.genie
+        - model-serving
       resources:
         - name: genie-space
           description: "Genie space for natural language data queries"
