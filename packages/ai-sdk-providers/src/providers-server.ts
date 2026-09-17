@@ -21,6 +21,13 @@ import {
 export const CONTEXT_HEADER_CONVERSATION_ID = 'x-databricks-conversation-id';
 export const CONTEXT_HEADER_USER_ID = 'x-databricks-user-id';
 
+// Model id routed by the two-stage orchestration to a plain serving-endpoint
+// LLM. Unlike the chat model, it must resolve to a real model even in Genie
+// mode, so the router below special-cases it.
+export const SYNTHESIS_MODEL_ID = 'synthesis-model';
+// Serving endpoint backing that second stage. Overridable per environment.
+export const DEFAULT_SYNTHESIS_ENDPOINT = 'databricks-deepseek-v4-1-flash';
+
 // Use centralized authentication - only on server side
 async function getProviderToken(): Promise<string> {
   // First, check if we have a PAT token
@@ -398,6 +405,16 @@ export class OAuthAwareProvider implements SmartProvider {
     if (isGenieConfigured()) {
       if (id === 'title-model' || id === 'artifact-model') {
         return createGenieTitleModel();
+      }
+      // Second stage of the Genie -> LLM orchestration: even in Genie mode we
+      // need a normal chat model to turn Genie's raw output into the final
+      // answer, so route this id to a serving endpoint instead of the space.
+      if (id === SYNTHESIS_MODEL_ID) {
+        const provider = await getOrCreateDatabricksProvider();
+        return provider.chatCompletions(
+          process.env.DATABRICKS_SYNTHESIS_ENDPOINT ??
+            DEFAULT_SYNTHESIS_ENDPOINT,
+        );
       }
       return createGenieLanguageModel(id);
     }

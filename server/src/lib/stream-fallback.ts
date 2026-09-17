@@ -12,9 +12,14 @@ import { generateUUID } from '@chat-template/core';
 export async function drainStreamToWriter(
   uiStream: ReadableStream,
   writer: UIMessageStreamWriter,
+  options?: { skipStart?: boolean },
 ): Promise<{ failed: boolean; errorText?: string }> {
   const reader = uiStream.getReader();
   let receivedTextChunk = false;
+  // When a second model stream is merged into an already-started UI message
+  // stream, its leading `start` chunk must be dropped: writing it again would
+  // reset the message id the first stage already established.
+  const skipStart = options?.skipStart ?? false;
 
   try {
     for (
@@ -22,6 +27,9 @@ export async function drainStreamToWriter(
       !chunk.done;
       chunk = await reader.read()
     ) {
+      if (skipStart && chunk.value.type === 'start') {
+        continue;
+      }
       if (chunk.value.type === 'error') {
         if (!receivedTextChunk) {
           console.error(
@@ -53,6 +61,57 @@ export async function drainStreamToWriter(
   }
 
   return { failed: false };
+}
+
+/**
+ * Like drainStreamToWriter, but captures text deltas instead of forwarding
+ * them. Reasoning/status/source parts and errors are still forwarded so the
+ * client keeps seeing progress while the first stage runs. Returns the
+ * accumulated text so the caller can feed it to a second-stage model.
+ */
+export async function drainStreamCapturingText(
+  uiStream: ReadableStream,
+  writer: UIMessageStreamWriter,
+): Promise<{ failed: boolean; text: string; errorText?: string }> {
+  const reader = uiStream.getReader();
+  let text = '';
+  let failed = false;
+  let errorText: string | undefined;
+
+  try {
+    for (
+      let chunk = await reader.read();
+      !chunk.done;
+      chunk = await reader.read()
+    ) {
+      const value = chunk.value;
+      switch (value.type) {
+        case 'text-delta':
+          text += value.delta;
+          break;
+        case 'text-start':
+        case 'text-end':
+          // Swallow the text framing: the captured text is emitted downstream
+          // by the second stage instead.
+          break;
+        case 'error':
+          failed = true;
+          errorText = value.errorText;
+          writer.write(value);
+          break;
+        default:
+          writer.write(value);
+          break;
+      }
+    }
+  } catch (readError) {
+    failed = true;
+    console.error('[drainStreamCapturingText] Stream read error:', readError);
+  } finally {
+    reader.releaseLock();
+  }
+
+  return { failed, text, errorText };
 }
 
 /**

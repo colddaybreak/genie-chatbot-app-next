@@ -23,8 +23,17 @@ const CONTEXT_HEADER_ACCESS_TOKEN = 'x-forwarded-access-token';
 
 const GENIE_API_PREFIX = '/api/2.0/genie/spaces';
 
-const DEFAULT_POLL_INTERVAL_MS = 1500;
+const DEFAULT_POLL_INTERVAL_MS = 800;
 const DEFAULT_TIMEOUT_MS = 120_000;
+
+// Genie only exposes the final answer once the message reaches COMPLETED, so
+// real token streaming is impossible. Instead we replay the finished answer
+// progressively so the client renders a typewriter effect instead of a single
+// "pop in" after the (often long) wait.
+const PSEUDO_STREAM_TARGET_MS = 2000;
+const PSEUDO_STREAM_MIN_DELAY_MS = 4;
+const PSEUDO_STREAM_MAX_DELAY_MS = 40;
+const PSEUDO_STREAM_CHUNK_SIZE = 4;
 
 // Human-readable descriptions for Genie message lifecycle statuses.
 const STATUS_MESSAGES: Record<string, string> = {
@@ -327,6 +336,40 @@ function truncatePreserveWords(input: string, maxLength: number): string {
   return slice.slice(0, lastSpaceIndex);
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Plan a progressive replay of the final Genie answer.
+ *
+ * Genie's REST API is submit-and-poll, so the full text only exists once the
+ * message is COMPLETED and the provider cannot forward real model tokens.
+ * Emitting everything in one delta makes the answer "pop in" after the wait, so
+ * we split it into small code-point-safe chunks and pace them so the whole
+ * replay takes roughly PSEUDO_STREAM_TARGET_MS regardless of answer length.
+ */
+function planPseudoStream(
+  text: string,
+): Array<{ delta: string; delayMs: number }> {
+  const codePoints = Array.from(text);
+  const chunks: string[] = [];
+  for (let i = 0; i < codePoints.length; i += PSEUDO_STREAM_CHUNK_SIZE) {
+    chunks.push(codePoints.slice(i, i + PSEUDO_STREAM_CHUNK_SIZE).join(''));
+  }
+  if (chunks.length === 0) return [];
+
+  const delayMs = Math.min(
+    PSEUDO_STREAM_MAX_DELAY_MS,
+    Math.max(
+      PSEUDO_STREAM_MIN_DELAY_MS,
+      Math.round(PSEUDO_STREAM_TARGET_MS / chunks.length),
+    ),
+  );
+
+  return chunks.map((delta) => ({ delta, delayMs }));
+}
+
 const EMPTY_USAGE: LanguageModelV3Usage = {
   inputTokens: {
     total: undefined,
@@ -463,7 +506,11 @@ export class GenieLanguageModel implements LanguageModelV3 {
           );
           if (text) {
             controller.enqueue({ type: 'text-start', id: textId });
-            controller.enqueue({ type: 'text-delta', id: textId, delta: text });
+            for (const { delta, delayMs } of planPseudoStream(text)) {
+              if (options.abortSignal?.aborted) break;
+              controller.enqueue({ type: 'text-delta', id: textId, delta });
+              await delay(delayMs);
+            }
             controller.enqueue({ type: 'text-end', id: textId });
           } else {
             controller.enqueue({
