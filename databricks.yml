@@ -1,18 +1,18 @@
 bundle:
-  name: databricks-chatbot
+  name: C-mold-chatbot
 
 variables:
   genie_space_id:
     description: "ID of the Genie space used by the app for natural language data queries"
     # TODO: uncomment the line below and specify a default value to avoid needing to specify it on each deployment
-    # default: "your-genie-space-id-goes-here"
+    default: "01f1b0005f5114ac8798080b582aa8fa"
   genie_space_name:
     description: "Display name of the Genie space"
     # TODO: uncomment the line below to provide a default display name
-    # default: "your-genie-space-name-goes-here"
+    default: "Mold Development Projects"
   database_instance_name:
     description: "Base name of the Lakebase database instance"
-    default: "chatbot-lakebase"
+    default: "C-mold-chatbot-lakebase"
   resource_name_suffix:
     description: "Suffix for resource names (app/lakebase instance names etc). Helpful for avoiding name collisions if multiple users deploy this app to the same workspace"
 
@@ -26,7 +26,7 @@ resources:
   apps:
     databricks_chatbot:
       # NOTE: customize the app name here, if desired
-      name: db-chatbot-${var.resource_name_suffix}
+      name: c-mold-chatbot
       # NOTE: the app calls Genie on behalf of the user, so the user_api_scope
       # below must be granted when the OAuth consent screen is shown.
       description: "Chat application backed by Databricks AI/BI Genie for natural language data queries"
